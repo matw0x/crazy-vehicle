@@ -1,0 +1,259 @@
+"""Модульные тесты TC-01…TC-16; подготовка, действие, проверка (AAA)."""
+
+from walking_plane import (
+    CrazyVehicleError, WalkingPlaneError, PlaneUnsupportedTerrain,
+    PlaneLegsDamaged, PlaneObstacleTooHigh, PlaneNoEnergy,
+)
+from tests.support import PlaneTestCase, new_plane
+
+
+class TestWalkingPlane(PlaneTestCase):
+    def test_TC_01_initial_state(self):
+        """TC-01: значения по умолчанию, границы энергии и сохранение имени."""
+        # Arrange / Act
+        p = new_plane(name=" Топот ")
+        # Assert
+        self.assertEqual(p.name, " Топот ")
+        self.assertEqual(p.mass_kg, 1000)
+        self.assertEqual(p.leg_length_m, 2)
+        self.assertEqual(p.max_speed_kmh, 20)
+        self.assertEqual(p.max_step_height_m, 1)
+        self.assertPlaneState(p, position=0, energy=100)
+        for energy in (0, 100):
+            with self.subTest(energy=energy):
+                self.assertEqual(new_plane(energy=energy).energy, energy)
+
+    def test_TC_02_constructor_invalid_values(self):
+        """TC-02: диапазоны и конечность аргументов конструктора."""
+        # Arrange
+        cases = [("name", ""), ("name", " \t\n")]
+        for field in ("mass_kg", "leg_length_m", "max_speed_kmh"):
+            cases += [(field, x) for x in (0, -1, float("nan"), float("inf"), -float("inf"))]
+        cases += [("energy", x) for x in (-1, 101, float("nan"), float("inf"), -float("inf"))]
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                # Act / Assert
+                with self.assertRaises(ValueError):
+                    new_plane(**{field: value})
+        # Два неверных аргумента: name проверяется раньше mass_kg.
+        with self.assertRaises(ValueError):
+            new_plane(name="", mass_kg="wrong")
+
+    def test_TC_03_constructor_types(self):
+        """TC-03: типы конструктора, bool запрещён, большие конечные значения."""
+        # Arrange
+        for field in ("name", "mass_kg", "leg_length_m", "max_speed_kmh", "energy"):
+            values = (None, 42, True) if field == "name" else (None, "2", True, [])
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    # Act / Assert
+                    with self.assertRaises(TypeError):
+                        new_plane(**{field: value})
+        p = new_plane(leg_length_m=1e308)
+        self.assertEqual(p.max_step_height_m, 5e307)
+
+    def test_TC_04_attributes_read_only(self):
+        """TC-04: все публичные атрибуты защищены от присваивания."""
+        # Arrange
+        p = new_plane()
+        for field in p.get_status():
+            with self.subTest(field=field):
+                # Act / Assert
+                self.assertRefusedWithoutChanges(p, AttributeError, setattr, p, field, None)
+
+    def test_TC_05_movement_formulas(self):
+        """TC-05: время, расход и накопление позиции на двух поверхностях."""
+        # Arrange
+        p = new_plane()
+        before = p.get_status()
+        # Act
+        road = p.move(5, "road")
+        rough = p.move(5, "rough")
+        # Assert
+        self.assertHours(road, 0.25)
+        self.assertHours(rough, 0.5)
+        self.assertPlaneState(p, position=10, energy=70)
+        for key in before.keys() - {"position_km", "energy"}:
+            self.assertEqual(p.get_status()[key], before[key])
+
+    def test_TC_06_exact_movement_energy(self):
+        """TC-06: движение на весь запас энергии для обеих поверхностей."""
+        for terrain, distance in (("road", 50), ("rough", 25)):
+            with self.subTest(terrain=terrain):
+                # Arrange
+                p = new_plane()
+                # Act
+                hours = p.move(distance, terrain)
+                # Assert
+                self.assertHours(hours, 2.5)
+                self.assertPlaneState(p, position=distance, energy=0)
+
+    def test_TC_07_move_validation_and_overflow(self):
+        """TC-07: неверные аргументы, приоритет валидации и переполнение."""
+        # Arrange
+        p = new_plane()
+        cases = [(TypeError, x, "road") for x in (None, "1", True)]
+        cases += [(ValueError, x, "air") for x in (0, -1, float("nan"), float("inf"), -float("inf"))]
+        cases += [(TypeError, 1, x) for x in (None, 1, [])]
+        cases += [(ValueError, 1, x) for x in ("lava", "ROAD", "")]
+        cases += [(ValueError, 1e308, "rough")]
+        for exc, distance, terrain in cases:
+            with self.subTest(distance=distance, terrain=terrain):
+                # Act / Assert
+                self.assertRefusedWithoutChanges(p, exc, p.move, distance, terrain)
+        slow = new_plane(max_speed_kmh=1e-308)
+        self.assertRefusedWithoutChanges(slow, ValueError, slow.move, 10, "road")
+
+    def test_TC_08_move_domain_errors(self):
+        """TC-08: запрещённая среда, ноги, нехватка и порядок доменных отказов."""
+        # Arrange
+        p = new_plane(energy=0)
+        p.damage_legs()
+        # Act / Assert
+        for terrain in ("air", "water"):
+            self.assertRefusedWithoutChanges(p, PlaneUnsupportedTerrain, p.move, 1, terrain)
+        for terrain in ("road", "rough"):
+            self.assertRefusedWithoutChanges(p, PlaneLegsDamaged, p.move, 1, terrain)
+        p.repair_legs()
+        self.assertRefusedWithoutChanges(p, PlaneNoEnergy, p.move, 1, "road")
+        p = new_plane(energy=1.999)
+        self.assertRefusedWithoutChanges(p, PlaneNoEnergy, p.move, 1, "road")
+
+    def test_TC_09_energy_calculation(self):
+        """TC-09: чистый расчёт, формулы, валидация, независимость от ног/топлива."""
+        # Arrange
+        p = new_plane(energy=0)
+        p.damage_legs()
+        before = p.get_status()
+        # Act / Assert
+        for terrain, expected in (("road", 20), ("rough", 40)):
+            self.assertEqual(p.calculate_energy(10, terrain), expected)
+        cases = [(TypeError, True, "road"), (TypeError, "1", "road"),
+                 (TypeError, 1, None), (ValueError, 0, "air"),
+                 (ValueError, -1, "road"), (ValueError, float("nan"), "road"),
+                 (ValueError, float("inf"), "road"), (ValueError, 1, "lava"),
+                 (ValueError, 1e308, "rough"),
+                 (PlaneUnsupportedTerrain, 1, "water"),
+                 (PlaneUnsupportedTerrain, 1, "air")]
+        for exc, distance, terrain in cases:
+            with self.subTest(distance=distance, terrain=terrain):
+                self.assertRefusedWithoutChanges(p, exc, p.calculate_energy, distance, terrain)
+        self.assertEqual(p.get_status(), before)
+        slow = new_plane(max_speed_kmh=1e-308)
+        self.assertEqual(slow.calculate_energy(10, "road"), 20)
+
+    def test_TC_10_obstacle_query(self):
+        """TC-10: предикат учитывает высоту, ноги и энергию, не меняя состояние."""
+        for energy, height, intact, expected in (
+            (10, 1, True, True), (10, 1.001, True, False),
+            (9.999, 1, True, False), (100, 0.5, False, False),
+        ):
+            with self.subTest(energy=energy, height=height, intact=intact):
+                # Arrange
+                p = new_plane(energy=energy)
+                if not intact:
+                    p.damage_legs()
+                before = p.get_status()
+                # Act
+                result = p.can_step_over(height)
+                # Assert
+                self.assertIs(result, expected)
+                self.assertEqual(p.get_status(), before)
+        for value, exc in ((True, TypeError), (None, TypeError), ("1", TypeError),
+                           (0, ValueError), (-1, ValueError),
+                           (float("nan"), ValueError), (float("inf"), ValueError),
+                           (-float("inf"), ValueError), (1e308, ValueError)):
+            self.assertRefusedWithoutChanges(p, exc, p.can_step_over, value)
+
+    def test_TC_11_step_success(self):
+        """TC-11: манёвр на пределе высоты и энергии, возврат None."""
+        # Arrange
+        p = new_plane(energy=15)
+        # Act / Assert
+        self.assertIsNone(p.step_over(0.5))
+        self.assertPlaneState(p, position=0, energy=10)
+        self.assertTrue(p.can_step_over(1))
+        self.assertIsNone(p.step_over(1))
+        self.assertPlaneState(p, position=0, energy=0)
+
+    def test_TC_12_step_errors_and_priority(self):
+        """TC-12: валидация, приоритеты, переполнение и атомарность манёвра."""
+        # Arrange
+        p = new_plane(energy=0)
+        p.damage_legs()
+        # Act / Assert
+        for value, exc in ((True, TypeError), (None, TypeError), ("1", TypeError),
+                           (0, ValueError), (-1, ValueError),
+                           (float("nan"), ValueError), (float("inf"), ValueError),
+                           (-float("inf"), ValueError), (2, PlaneLegsDamaged)):
+            self.assertRefusedWithoutChanges(p, exc, p.step_over, value)
+        p.repair_legs()
+        self.assertRefusedWithoutChanges(p, PlaneObstacleTooHigh, p.step_over, 1.001)
+        self.assertRefusedWithoutChanges(p, PlaneNoEnergy, p.step_over, 1)
+        large = new_plane(leg_length_m=1e308)
+        self.assertRefusedWithoutChanges(large, ValueError, large.step_over, 5e307)
+
+    def test_TC_13_refuel(self):
+        """TC-13: заправка, предел 100, неверные аргументы, повреждённые ноги."""
+        # Arrange
+        p = new_plane(energy=20)
+        p.damage_legs()
+        # Act / Assert
+        self.assertIsNone(p.refuel(50))
+        self.assertPlaneState(p, position=0, energy=70, intact=False)
+        for amount in (1000, 1e308, 1):
+            self.assertIsNone(p.refuel(amount))
+            self.assertPlaneState(p, position=0, energy=100, intact=False)
+        for value, exc in ((True, TypeError), (None, TypeError), ("1", TypeError),
+                           (0, ValueError), (-1, ValueError),
+                           (float("nan"), ValueError), (float("inf"), ValueError),
+                           (-float("inf"), ValueError)):
+            self.assertRefusedWithoutChanges(p, exc, p.refuel, value)
+
+    def test_TC_14_damage_and_repair(self):
+        """TC-14: повреждение и ремонт повторяемы и не тратят энергию."""
+        # Arrange
+        p = new_plane(energy=0)
+        before = p.get_status()
+        # Act / Assert
+        for action, expected in ((p.damage_legs, False), (p.damage_legs, False),
+                                 (p.repair_legs, True), (p.repair_legs, True)):
+            self.assertIsNone(action())
+            after = p.get_status()
+            self.assertIs(after.pop("legs_intact"), expected)
+            self.assertEqual(after, {k: v for k, v in before.items() if k != "legs_intact"})
+
+    def test_TC_15_status_snapshot(self):
+        """TC-15: точные ключи, типы, значения и независимость снимков."""
+        # Arrange
+        p = new_plane()
+        expected = dict(name="Топот", mass_kg=1000.0, leg_length_m=2.0,
+                        max_speed_kmh=20.0, max_step_height_m=1.0,
+                        energy=100.0, position_km=0.0, legs_intact=True)
+        # Act
+        snapshot = p.get_status()
+        # Assert
+        self.assertIs(type(snapshot), dict)
+        self.assertEqual(snapshot, expected)
+        for key, value in expected.items():
+            self.assertIs(type(snapshot[key]), type(value))
+            self.assertEqual(getattr(p, key), value)
+        snapshot["energy"] = -1
+        snapshot["extra"] = True
+        self.assertEqual(p.get_status(), expected)
+        frozen = p.get_status()
+        self.assertIsNot(frozen, p.get_status())
+        p.move(1, "road")
+        self.assertEqual(frozen, expected)
+        self.assertEqual(p.get_status()["energy"], 98)
+        self.assertEqual(p.get_status()["position_km"], 1)
+
+    def test_TC_16_exception_hierarchy(self):
+        """TC-16: публичная иерархия доменных исключений."""
+        # Arrange / Act / Assert
+        self.assertTrue(issubclass(CrazyVehicleError, Exception))
+        self.assertTrue(issubclass(WalkingPlaneError, CrazyVehicleError))
+        for exc in (PlaneUnsupportedTerrain, PlaneLegsDamaged,
+                    PlaneObstacleTooHigh, PlaneNoEnergy):
+            with self.subTest(exception=exc.__name__):
+                self.assertTrue(issubclass(exc, WalkingPlaneError))
